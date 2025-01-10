@@ -1,38 +1,40 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os
-import io
-import re
-import time
-import math
-import json
-import html
-import random
-import sqlite3
-import weakref
-import logging
-import warnings
-import datetime
-import itertools
 import collections
-import configparser
 import collections.abc
 import concurrent.futures
+import configparser
+import datetime
+import html
+import io
+import itertools
+import json
+import logging
+import math
+import os
+import random
+import re
+import sqlite3
+import time
+import warnings
+import weakref
 
 import pycurl
-import prcoords
-import tornado.web
+import tornado.curl_httpclient
 import tornado.gen
-import tornado.locks
-import tornado.ioloop
 import tornado.httpclient
 import tornado.httpserver
-import tornado.curl_httpclient
+import tornado.ioloop
+import tornado.locks
+import tornado.web
 from PIL import Image
+
+import prcoords
 
 try:
     import certifi
+
     CA_CERTS = certifi.where()
 except ImportError:
     CA_CERTS = None
@@ -40,15 +42,17 @@ except ImportError:
 try:
     from pyproj import Transformer
     from pyproj.crs import CRS
+
     PROJ_AVAILABLE = True
 except ImportError:
     PROJ_AVAILABLE = False
 
 
 logging.basicConfig(
-    #level=logging.INFO,
+    # level=logging.INFO,
     level=logging.WARNING,
-    format='%(asctime)s [%(levelname)s] %(message)s')
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
 
 logging.captureWarnings(True)
 # warnings.simplefilter("ignore")
@@ -62,17 +66,19 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG = {}
 APIS = None
 
-re_user_agent = re.compile(r'Mozilla/5.0 \(.+(Chrome|Gecko|AppleWebKit|Safari|Edg)')
+re_user_agent = re.compile(r"Mozilla/5.0 \(.+(Chrome|Gecko|AppleWebKit|Safari|Edg)")
 HEADERS_WHITELIST = {
-    'Accept-Encoding',
-    'Upgrade-Insecure-Requests',
-    'Dnt',
-    'Cookie',
-    'User-Agent',
-    'Accept',
-    'Accept-Language'
+    "Accept-Encoding",
+    "Upgrade-Insecure-Requests",
+    "Dnt",
+    "Cookie",
+    "User-Agent",
+    "Accept",
+    "Accept-Language",
 }
-DEFAULT_USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0'
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0"
+)
 HTTP_CLIENT = tornado.curl_httpclient.CurlAsyncHTTPClient()
 
 
@@ -90,35 +96,50 @@ def projection_4326(lon, lat):
     return (lon, lat)
 
 
+"""
+瓦片地图代理服务器
+提供多种地图服务转换和缓存功能
+"""
+
+
 class DBTileCache(collections.abc.MutableMapping):
+    """
+    基于SQLite的瓦片缓存实现
+    - 支持瓦片图片和元数据的持久化存储
+    - 自动清理过期和超量的缓存
+    """
 
     def __init__(self, filename, maxsize, ttl):
         self.maxsize = maxsize
         self.ttl = ttl
         self.db = sqlite3.connect(filename, isolation_level=None)
-        self.db.execute('PRAGMA journal_mode=WAL')
-        self.db.execute('CREATE TABLE IF NOT EXISTS cache ('
-            'key TEXT PRIMARY KEY,'
-            'expire INTEGER,'
-            'updated INTEGER,'
-            'mime TEXT,'
-            'img BLOB'
-        ') WITHOUT ROWID')
-        self.db.execute('CREATE TABLE IF NOT EXISTS metadata ('
-            'key TEXT PRIMARY KEY,'
-            'value TEXT'
-        ') WITHOUT ROWID')
+        self.db.execute("PRAGMA journal_mode=WAL")
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS cache ("
+            "key TEXT PRIMARY KEY,"
+            "expire INTEGER,"
+            "updated INTEGER,"
+            "mime TEXT,"
+            "img BLOB"
+            ") WITHOUT ROWID"
+        )
+        self.db.execute(
+            "CREATE TABLE IF NOT EXISTS metadata ("
+            "key TEXT PRIMARY KEY,"
+            "value TEXT"
+            ") WITHOUT ROWID"
+        )
 
     def __contains__(self, key):
         r = self.db.execute(
-            'SELECT 1 FROM cache WHERE key=? AND expire>=?', (key, time.time())
-            ).fetchone()
+            "SELECT 1 FROM cache WHERE key=? AND expire>=?", (key, time.time())
+        ).fetchone()
         return bool(r)
 
     def __getitem__(self, key):
         r = self.db.execute(
-            'SELECT img, mime FROM cache WHERE key=? AND expire>=?', (key, time.time())
-            ).fetchone()
+            "SELECT img, mime FROM cache WHERE key=? AND expire>=?", (key, time.time())
+        ).fetchone()
         if r:
             return r
         else:
@@ -128,17 +149,19 @@ class DBTileCache(collections.abc.MutableMapping):
         if ttl is None:
             ttl = self.ttl
         now = int(time.time())
-        self.db.execute('REPLACE INTO cache VALUES (?,?,?,?,?)',
-            (key, now+ttl, now, value[1], value[0]))
+        self.db.execute(
+            "REPLACE INTO cache VALUES (?,?,?,?,?)",
+            (key, now + ttl, now, value[1], value[0]),
+        )
         self.expire()
 
     def set_meta(self, key, value):
-        self.db.execute('REPLACE INTO metadata VALUES (?,?)',
-            (key, json.dumps(value)))
+        self.db.execute("REPLACE INTO metadata VALUES (?,?)", (key, json.dumps(value)))
 
     def get_meta(self, key):
         row = self.db.execute(
-            'SELECT value FROM metadata WHERE key=?', (key,)).fetchone()
+            "SELECT value FROM metadata WHERE key=?", (key,)
+        ).fetchone()
         if row is None:
             return None
         return json.loads(row[0])
@@ -147,25 +170,28 @@ class DBTileCache(collections.abc.MutableMapping):
         self.save(key, value)
 
     def __delitem__(self, key):
-        self.db.execute('DELETE FROM cache WHERE key=?', (key,))
+        self.db.execute("DELETE FROM cache WHERE key=?", (key,))
 
     def __iter__(self):
-        for row in self.db.execute('SELECT key FROM cache'):
+        for row in self.db.execute("SELECT key FROM cache"):
             yield row[0]
 
     def __len__(self):
         r = self.db.execute(
-            'SELECT count(*) FROM cache WHERE expire>=?', (time.time(),)).fetchone()
+            "SELECT count(*) FROM cache WHERE expire>=?", (time.time(),)
+        ).fetchone()
         return r[0]
 
     def expire(self, etime=None):
         """Remove expired items from the cache."""
-        self.db.execute('DELETE FROM cache WHERE key NOT IN ('
-            'SELECT key FROM cache WHERE expire>=? ORDER BY updated DESC LIMIT ?)',
-            (etime or time.time(), self.maxsize))
+        self.db.execute(
+            "DELETE FROM cache WHERE key NOT IN ("
+            "SELECT key FROM cache WHERE expire>=? ORDER BY updated DESC LIMIT ?)",
+            (etime or time.time(), self.maxsize),
+        )
 
     def clear(self):
-        self.db.execute('DELETE FROM cache')
+        self.db.execute("DELETE FROM cache")
 
     def get(self, key, default=None):
         try:
@@ -198,7 +224,7 @@ class MemoryTileCache(collections.abc.MutableMapping):
         if ttl is None:
             ttl = self.ttl
         now = int(time.time())
-        self.cache[key] = (now+ttl, value[0], value[1])
+        self.cache[key] = (now + ttl, value[0], value[1])
         self.expire()
 
     def set_meta(self, key, value):
@@ -227,9 +253,9 @@ class MemoryTileCache(collections.abc.MutableMapping):
         keys = tuple(self.cache.keys())
         i = 0
         now = time.time()
-        while (i < orig_len and (
+        while i < orig_len and (
             self.cache[keys[i]][0] < now or len(self.cache) > self.maxsize
-        )):
+        ):
             self.cache.popitem(last=False)
             i += 1
 
@@ -248,13 +274,14 @@ class KeyedAsyncLocks(collections.abc.Collection):
     asyncio.Lock with names.
     Automatically create and delete locks for specified names.
     """
+
     def __init__(self):
         self.locks = weakref.WeakValueDictionary()
 
     def __len__(self) -> int:
         return len(self.locks)
 
-    def __getitem__(self, item) -> 'tornado.locks.Lock':
+    def __getitem__(self, item) -> "tornado.locks.Lock":
         lock = self.locks.get(item)
         if lock is None:
             self.locks[item] = lock = tornado.locks.Lock()
@@ -280,6 +307,11 @@ class KeyedAsyncLocks(collections.abc.Collection):
 
 
 class TileProvider:
+    """
+    基础瓦片服务提供者
+    定义了获取和转换瓦片的基本接口
+    """
+
     sgn = (1, 1)
     has_metadata = False
     retry_on_error = False
@@ -313,9 +345,11 @@ class TileProvider:
 
     def url_params(self, x, y, z):
         return {
-            's': (random.choice(self.servers) if self.servers else ''),
-            'x': x, 'y': y, 'z': z,
-            't': int(time.time() * 1000),
+            "s": (random.choice(self.servers) if self.servers else ""),
+            "x": x,
+            "y": y,
+            "z": z,
+            "t": int(time.time() * 1000),
         }
 
     def get_url(self, x, y, z, retina=False):
@@ -332,12 +366,12 @@ class TileProvider:
         elif not PROJ_AVAILABLE:
             raise RuntimeError("Unsupported CRS: %s" % crs)
         if isinstance(crs, int):
-            target_crs = CRS('EPSG:%s' % crs)
+            target_crs = CRS("EPSG:%s" % crs)
         else:
             target_crs = CRS(crs)
         self._transformer = Transformer.from_crs(
-            CRS("+proj=longlat +datum=WGS84 +no_defs"),
-            target_crs)
+            CRS("+proj=longlat +datum=WGS84 +no_defs"), target_crs
+        )
         self.projection_fn = self._transformer.transform
 
 
@@ -352,9 +386,13 @@ class TMSTileProvider(TileProvider):
 
 
 class GCJTileProvider(TileProvider):
+    """
+    火星坐标系(GCJ-02)瓦片服务
+    处理偏移过的中国地图瓦片
+    """
 
     def fast_offset_check(self, z):
-        return (z < 8)
+        return z < 8
 
     def offset(self, x, y, z):
         if z < 8:
@@ -372,19 +410,24 @@ class QQTileProvider(TileProvider):
 
     def url_params(self, x, y, z):
         params = super().url_params(x, y, z)
-        params['x4'] = (x>>4)
-        params['y4'] = (y>>4)
+        params["x4"] = x >> 4
+        params["y4"] = y >> 4
         return params
 
     def offset(self, x, y, z):
         if z < 8:
             return (x, 2**z - 1 - y, z)
-        realpos = prcoords.wgs_gcj(num2deg(x, y+1, z), True)
+        realpos = prcoords.wgs_gcj(num2deg(x, y + 1, z), True)
         realx, realy = deg2num(zoom=z, *realpos)
         return (realx, 2**z - realy, z)
 
 
 class BaiduTileProvider(TileProvider):
+    """
+    百度地图瓦片服务
+    处理百度特有的墨卡托投影和坐标偏移
+    """
+
     sgn = (1, -1)
 
     def fast_offset_check(self, z):
@@ -392,9 +435,9 @@ class BaiduTileProvider(TileProvider):
 
     def url_params(self, x, y, z):
         params = super().url_params(x, y, z)
-        params['xm'] = str(x).replace('-', 'M')
-        params['ym'] = str(y).replace('-', 'M')
-        params['d'] = datetime.date.today().strftime('%Y%m%d')
+        params["xm"] = str(x).replace("-", "M")
+        params["ym"] = str(y).replace("-", "M")
+        params["d"] = datetime.date.today().strftime("%Y%m%d")
         return params
 
     @staticmethod
@@ -411,11 +454,11 @@ class BaiduTileProvider(TileProvider):
         return (x, y)
 
     def offset(self, x, y, z):
-        realpos = prcoords.wgs_bd(num2deg(x, y+1, z), True)
-        if 'upscale' not in self.attrs:
+        realpos = prcoords.wgs_bd(num2deg(x, y + 1, z), True)
+        if "upscale" not in self.attrs:
             z += 1
         x, y = self.bd_merc(*realpos)
-        factor = 2**(z - 18 - 8)
+        factor = 2 ** (z - 18 - 8)
         return (x * factor, y * factor, z)
 
 
@@ -435,11 +478,11 @@ class ArcGISMapServerProvider(TileProvider):
     def fast_offset_check(self, z):
         if not self.metadata or not self.no_offset:
             return False
-        return bool(self.metadata.get('no_offset'))
+        return bool(self.metadata.get("no_offset"))
 
     def get_srid(self, tile_info):
-        spref = tile_info.get('spatialReference', {})
-        srid = spref.get('latestWkid', spref.get('wkid', 4326))
+        spref = tile_info.get("spatialReference", {})
+        srid = spref.get("latestWkid", spref.get("wkid", 4326))
         if srid in (102113, 900913, 3587, 54004, 41001, 102100, 3785):
             srid = 3857
         return srid
@@ -451,46 +494,53 @@ class ArcGISMapServerProvider(TileProvider):
             cached_metadata = self.cache.get_meta(self.name)
             if cached_metadata is not None:
                 self.metadata = cached_metadata
-                self.load_projection(self.metadata['srid'])
+                self.load_projection(self.metadata["srid"])
                 return
         client = tornado.curl_httpclient.CurlAsyncHTTPClient()
         response = await client.fetch(
-            self.url + '?f=json',
-            headers=headers, connect_timeout=10, ca_certs=CA_CERTS,
-            proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'),
-            prepare_curl_callback=(prepare_curl_socks5
-                if 'socks5' == CONFIG.get('proxy_type') else None)
+            self.url + "?f=json",
+            headers=headers,
+            connect_timeout=10,
+            ca_certs=CA_CERTS,
+            proxy_host=CONFIG.get("proxy_host"),
+            proxy_port=CONFIG.get("proxy_port"),
+            prepare_curl_callback=(
+                prepare_curl_socks5 if "socks5" == CONFIG.get("proxy_type") else None
+            ),
         )
         if response.code != 200:
             raise RuntimeError("Can't get metadata: code %s" % response.code)
-        d = json.loads(response.body.decode('utf-8', errors='ignore'))
-        if not d.get('singleFusedMapCache'):
+        d = json.loads(response.body.decode("utf-8", errors="ignore"))
+        if not d.get("singleFusedMapCache"):
             raise ValueError("Not tiled map")
-        tile_info = d['tileInfo']
+        tile_info = d["tileInfo"]
         srid = self.get_srid(tile_info)
         # if srid not in self.supported_srid:
-            # raise RuntimeError("Unsupported SRID: %s" % self.metadata['srid'])
+        # raise RuntimeError("Unsupported SRID: %s" % self.metadata['srid'])
         self.load_projection(srid)
         self.metadata = {
-            'size': (tile_info['cols'], tile_info['rows']),
-            'srid': srid,
-            'origin': (tile_info['origin']['x'], tile_info['origin']['y']),
-            'levels': sorted(
-                (level['level'], level['resolution']*tile_info['rows'])
-                for level in tile_info['lods']
+            "size": (tile_info["cols"], tile_info["rows"]),
+            "srid": srid,
+            "origin": (tile_info["origin"]["x"], tile_info["origin"]["y"]),
+            "levels": sorted(
+                (level["level"], level["resolution"] * tile_info["rows"])
+                for level in tile_info["lods"]
             ),
-            'no_offset': False
+            "no_offset": False,
         }
-        if (srid == 3857 and self.no_offset and
-            math.isclose(-ORIGIN_3857, self.metadata['origin'][0]) and
-            math.isclose(ORIGIN_3857, self.metadata['origin'][1])):
+        if (
+            srid == 3857
+            and self.no_offset
+            and math.isclose(-ORIGIN_3857, self.metadata["origin"][0])
+            and math.isclose(ORIGIN_3857, self.metadata["origin"][1])
+        ):
             no_offset = True
-            for level, resolution in self.metadata['levels']:
-                req_resolution = RES_3857 / 2 ** level
-                if not math.isclose(resolution, req_resolution, rel_tol=1/256):
+            for level, resolution in self.metadata["levels"]:
+                req_resolution = RES_3857 / 2**level
+                if not math.isclose(resolution, req_resolution, rel_tol=1 / 256):
                     no_offset = False
                     break
-            self.metadata['no_offset'] = no_offset
+            self.metadata["no_offset"] = no_offset
         self.cache.set_meta(self.name, self.metadata)
 
     async def check_metadata(self, headers=None, no_cache=False):
@@ -500,7 +550,7 @@ class ArcGISMapServerProvider(TileProvider):
 
     def convert_z(self, x, y, z, srid):
         if srid == 3857:
-            req_resolution = RES_3857 / 2 ** z
+            req_resolution = RES_3857 / 2**z
         else:
             lat0, lon0 = num2deg(x, y, z)
             lat1, lon1 = num2deg(x + 1, y + 1, z)
@@ -514,13 +564,13 @@ class ArcGISMapServerProvider(TileProvider):
                 x1, y1 = self.projection_fn(lon1, lat1)
             req_resolution = math.sqrt(abs(x1 - x0) * abs(y1 - y0))
         level = resolution = up_res = None
-        for level, resolution in self.metadata['levels']:
-            if abs(resolution - req_resolution) / req_resolution < 1/256:
+        for level, resolution in self.metadata["levels"]:
+            if abs(resolution - req_resolution) / req_resolution < 1 / 256:
                 return level, resolution
             elif resolution < req_resolution:
                 break
             up_res = (level, resolution)
-        if 'upscale' in self.attrs and up_res is not None:
+        if "upscale" in self.attrs and up_res is not None:
             return up_res
         return level, resolution
 
@@ -531,22 +581,22 @@ class ArcGISMapServerProvider(TileProvider):
     def offset(self, x, y, z):
         realpos_ll = tuple(reversed(self.offset_latlon(*num2deg(x, y, z))))
         realpos_xy = self.projection_fn(*realpos_ll)
-        tilez, resolution = self.convert_z(x, y, z, self.metadata['srid'])
+        tilez, resolution = self.convert_z(x, y, z, self.metadata["srid"])
         if tilez is None:
             return (None, None, None)
-        ox, oy = self.metadata['origin']
-        tilex = ((realpos_xy[0] - ox) / resolution)
+        ox, oy = self.metadata["origin"]
+        tilex = (realpos_xy[0] - ox) / resolution
         tiley = -((realpos_xy[1] - oy) / resolution)
         return (tilex, tiley, tilez)
 
     def get_url(self, x, y, z, retina=False):
-        return '{url}/tile/{z}/{y}/{x}'.format(url=self.url, x=x, y=y, z=z)
+        return "{url}/tile/{z}/{y}/{x}".format(url=self.url, x=x, y=y, z=z)
 
 
 class TiandituTileProvider(TileProvider):
     has_metadata = True
     retry_on_error = True
-    re_ticket = re.compile(r'tk=([0-9A-Za-z]+)')
+    re_ticket = re.compile(r"tk=([0-9A-Za-z]+)")
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -556,46 +606,50 @@ class TiandituTileProvider(TileProvider):
     async def get_metadata(self, headers=None, no_cache=False):
         if not no_cache:
             if self.metadata is not None:
-                return self.metadata['cookies']
+                return self.metadata["cookies"]
             cached_metadata = self.cache.get_meta(self.name)
             if cached_metadata is not None:
                 self.metadata = cached_metadata
-                return self.metadata['cookies']
+                return self.metadata["cookies"]
         client = tornado.curl_httpclient.CurlAsyncHTTPClient()
         response = await client.fetch(
-            'https://map.tianditu.gov.cn/2020/',
-            headers=headers, connect_timeout=10, ca_certs=CA_CERTS,
-            proxy_host=CONFIG.get('proxy_host'), proxy_port=CONFIG.get('proxy_port'),
-            prepare_curl_callback=(prepare_curl_socks5
-                if 'socks5' == CONFIG.get('proxy_type') else None)
+            "https://map.tianditu.gov.cn/2020/",
+            headers=headers,
+            connect_timeout=10,
+            ca_certs=CA_CERTS,
+            proxy_host=CONFIG.get("proxy_host"),
+            proxy_port=CONFIG.get("proxy_port"),
+            prepare_curl_callback=(
+                prepare_curl_socks5 if "socks5" == CONFIG.get("proxy_type") else None
+            ),
         )
         if response.code != 200:
             raise RuntimeError("Can't get metadata: code %s" % response.code)
-        match = self.re_ticket.search(
-            response.body.decode('utf-8', errors='ignore'))
+        match = self.re_ticket.search(response.body.decode("utf-8", errors="ignore"))
         if not match:
             raise RuntimeError("Can't find ticket")
         cookies = []
         for cookie in response.headers.get_list("Set-Cookie"):
-            cookies.append(cookie.rsplit(';', 1)[0].strip())
-        self.metadata = {'ticket': match.group(1), 'cookies': cookies}
+            cookies.append(cookie.rsplit(";", 1)[0].strip())
+        self.metadata = {"ticket": match.group(1), "cookies": cookies}
         self.cache.set_meta(self.name, self.metadata)
-        return self.metadata['cookies']
+        return self.metadata["cookies"]
 
     async def check_metadata(self, headers=None, no_cache=False):
         async with self.metadata_lock:
             cookies = await self.get_metadata(headers, no_cache)
-        if headers and headers.get('Cookie'):
-            cookies.insert(0, headers['Cookie'])
-        return {
-            'Cookie': '; '.join(cookies),
-            'Referer': 'https://map.tianditu.gov.cn/'
-        }
+        if headers and headers.get("Cookie"):
+            cookies.insert(0, headers["Cookie"])
+        return {"Cookie": "; ".join(cookies), "Referer": "https://map.tianditu.gov.cn/"}
 
     def get_url(self, x, y, z, retina=False):
         return self.url.format(
-            s=(random.choice(self.servers) if self.servers else ''),
-            x=x, y=y, z=z, tk=self.metadata['ticket'])
+            s=(random.choice(self.servers) if self.servers else ""),
+            x=x,
+            y=y,
+            z=z,
+            tk=self.metadata["ticket"],
+        )
 
 
 class GCJMapServerProvider(ArcGISMapServerProvider):
@@ -647,22 +701,25 @@ class TiandituShanghaiMapServerSHCorsProvider(ArcGISMapServerProvider):
     def load_projection(self, crs):
         self._transformer = Transformer.from_crs(
             CRS("+proj=longlat +datum=WGS84 +no_defs"),
-            CRS("+proj=tmerc +lat_0=31.235443609882868 +lon_0=121.46464574117608 +k=1 +x_0=-238.2131268606429 +y_0=0 +ellps=GRS80 +units=m +no_defs"))
+            CRS(
+                "+proj=tmerc +lat_0=31.235443609882868 +lon_0=121.46464574117608 +k=1 +x_0=-238.2131268606429 +y_0=0 +ellps=GRS80 +units=m +no_defs"
+            ),
+        )
         self.projection_fn = self._transformer.transform
 
 
 SRC_TYPE = {
-    'xyz': TileProvider,
-    'tms': TMSTileProvider,
-    'gcj': GCJTileProvider,
-    'qq': QQTileProvider,
-    'bd': BaiduTileProvider,
-    'baidu': BaiduTileProvider,
-    'arcgis': ArcGISMapServerProvider,
-    'arcgis_gcj': GCJMapServerProvider,
-    'tianditu': TiandituTileProvider,
-    'shtdt': TiandituShanghaiMapServerProvider,
-    'shtdt_shcors': TiandituShanghaiMapServerSHCorsProvider,
+    "xyz": TileProvider,
+    "tms": TMSTileProvider,
+    "gcj": GCJTileProvider,
+    "qq": QQTileProvider,
+    "bd": BaiduTileProvider,
+    "baidu": BaiduTileProvider,
+    "arcgis": ArcGISMapServerProvider,
+    "arcgis_gcj": GCJMapServerProvider,
+    "tianditu": TiandituTileProvider,
+    "shtdt": TiandituShanghaiMapServerProvider,
+    "shtdt_shcors": TiandituShanghaiMapServerSHCorsProvider,
 }
 TILE_SOURCE_CACHE = {}
 TILE_GET_LOCKS = KeyedAsyncLocks()
@@ -673,50 +730,51 @@ def load_config(config_file, tmsapi_file):
     if APIS:
         return
     config = configparser.ConfigParser(interpolation=None)
-    config.read(config_file, 'utf-8')
-    cfg = dict(config['CONFIG'])
-    cfg['port'] = int(cfg['port'])
-    cfg['cache_size'] = int(cfg['cache_size'])
-    cfg['cache_ttl'] = int(cfg['cache_ttl'])
-    cfg['cache_realtime_ttl'] = int(cfg.get('cache_realtime_ttl', 60))
-    if 'proxy_port' in cfg:
-        cfg['proxy_port'] = int(cfg['proxy_port'])
+    config.read(config_file, "utf-8")
+    cfg = dict(config["CONFIG"])
+    cfg["port"] = int(cfg["port"])
+    cfg["cache_size"] = int(cfg["cache_size"])
+    cfg["cache_ttl"] = int(cfg["cache_ttl"])
+    cfg["cache_realtime_ttl"] = int(cfg.get("cache_realtime_ttl", 60))
+    if "proxy_port" in cfg:
+        cfg["proxy_port"] = int(cfg["proxy_port"])
     CONFIG = cfg
-    if cfg.get('cache_db'):
+    if cfg.get("cache_db"):
         TILE_SOURCE_CACHE = DBTileCache(
-            cfg['cache_db'], cfg['cache_size'], cfg['cache_ttl'])
+            cfg["cache_db"], cfg["cache_size"], cfg["cache_ttl"]
+        )
     else:
-        TILE_SOURCE_CACHE = MemoryTileCache(cfg['cache_size'], cfg['cache_ttl'])
+        TILE_SOURCE_CACHE = MemoryTileCache(cfg["cache_size"], cfg["cache_ttl"])
     APIS = collections.OrderedDict()
     api_config = configparser.ConfigParser(interpolation=None)
-    api_config.read(tmsapi_file, 'utf-8')
+    api_config.read(tmsapi_file, "utf-8")
     for name, cfgsection in api_config.items():
-        if name in ('DEFAULT', 'CONFIG'):
+        if name in ("DEFAULT", "CONFIG"):
             continue
         section = dict(cfgsection)
-        src_type = section.get('type', section.get('offset', 'xyz'))
+        src_type = section.get("type", section.get("offset", "xyz"))
         cls = SRC_TYPE.get(src_type)
         if cls is None:
-            raise ValueError('unknown source API type: %s' % src_type)
-        kwargs = {'url': section.pop('url'), 'cache': TILE_SOURCE_CACHE}
-        if 'url2x' in section:
-            kwargs['url2x'] = section.pop('url2x')
-        if 's' in section:
-            kwargs['servers'] = section.pop('s').split(',')
-        kwargs['attrs'] = section
+            raise ValueError("unknown source API type: %s" % src_type)
+        kwargs = {"url": section.pop("url"), "cache": TILE_SOURCE_CACHE}
+        if "url2x" in section:
+            kwargs["url2x"] = section.pop("url2x")
+        if "s" in section:
+            kwargs["servers"] = section.pop("s").split(",")
+        kwargs["attrs"] = section
         APIS[name] = cls(name, **kwargs)
 
 
 def num2deg(xtile, ytile, zoom):
-    n = 2 ** zoom
+    n = 2**zoom
     lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * ytile / n))))
     lon = xtile / n * 360 - 180
     return (lat, lon)
 
 
 def deg2num(lat, lon, zoom):
-    n = 2 ** zoom
-    xtile = ((lon + 180) / 360 * n)
+    n = 2**zoom
+    xtile = (lon + 180) / 360 * n
     ytile = (1 - math.asinh(math.tan(math.radians(lat))) / math.pi) * n / 2
     return (xtile, ytile)
 
@@ -749,46 +807,48 @@ def stitch_tiles(tiles, corners, bbox, grid, sgnxy, name, target_format=None):
     if not size:
         return None, None
     target_format = target_format or orig_format
-    mode = 'RGB' if orig_mode == 'RGB' else 'RGBA'
-    newim = Image.new(mode, (
-        size[0]*(bbox[2]-bbox[0]), size[1]*(bbox[3]-bbox[1])))
+    mode = "RGB" if orig_mode == "RGB" else "RGBA"
+    newim = Image.new(
+        mode, (size[0] * (bbox[2] - bbox[0]), size[1] * (bbox[3] - bbox[1]))
+    )
     mesh = calc_pil_mesh(sgnxy, size, bbox, grid)
     for i, xy in enumerate(corners):
         if ims[i] is None:
             continue
-        xy0 = (size[0]*xy[0][0], size[1]*xy[1][0])
-        if mode == 'RGB':
+        xy0 = (size[0] * xy[0][0], size[1] * xy[1][0])
+        if mode == "RGB":
             newim.paste(ims[i], xy0)
         else:
             im = ims[i]
             if im.mode != mode:
                 im = im.convert(mode)
             if is_empty(im):
-                newim.paste((0,0,0,0), xy0 + (xy0[0]+size[0], xy0[1]+size[1]))
+                newim.paste((0, 0, 0, 0), xy0 + (xy0[0] + size[0], xy0[1] + size[1]))
             else:
                 newim.paste(im, xy0)
         ims[i].close()
     del ims
-    retim = newim.transform(size,
-        Image.Transform.MESH, mesh, resample=Image.Resampling.BICUBIC)
-    if retim.mode == 'RGBA' and retim.getextrema()[3][0] >= 252:
-        retim = retim.convert('RGB')
+    retim = newim.transform(
+        size, Image.Transform.MESH, mesh, resample=Image.Resampling.BICUBIC
+    )
+    if retim.mode == "RGBA" and retim.getextrema()[3][0] >= 252:
+        retim = retim.convert("RGB")
     newim.close()
     del newim
     retb = io.BytesIO()
     mime_type = tiles[0][1]
-    if target_format == 'JPEG':
-        if retim.mode == 'RGBA':
-            new_im = Image.new("RGBA", retim.size, "WHITE") 
+    if target_format == "JPEG":
+        if retim.mode == "RGBA":
+            new_im = Image.new("RGBA", retim.size, "WHITE")
             new_im.paste(retim, (0, 0), retim)
-            retim = new_im.convert('RGB')
-        retim.save(retb, 'JPEG', quality=93)
-        mime_type = 'image/jpeg'
+            retim = new_im.convert("RGB")
+        retim.save(retb, "JPEG", quality=93)
+        mime_type = "image/jpeg"
     else:
-        if orig_mode == 'P' and target_format == 'PNG':
+        if orig_mode == "P" and target_format == "PNG":
             retim = retim.quantize(colors=256)
         retim.save(retb, target_format)
-        mime_type = 'image/' + target_format.lower()
+        mime_type = "image/" + target_format.lower()
     retim.close()
     del retim
     return retb.getvalue(), mime_type
@@ -798,27 +858,26 @@ async def get_tile(source, z, x, y, retina=False, client_headers=None):
     api = APIS[source]
     x = int(x)
     y = int(y)
-    cache_key = '%s%s/%d/%d/%d' % (source, '@2x' if retina else '', z, x, y)
+    cache_key = "%s%s/%d/%d/%d" % (source, "@2x" if retina else "", z, x, y)
     async with TILE_GET_LOCKS[cache_key]:
         res = TILE_SOURCE_CACHE.get(cache_key)
         if res:
             return res
-        realtime = api.get('realtime')
+        realtime = api.get("realtime")
         req_headers = client_headers.copy() or {}
         client_kwargs = {
-            'headers': req_headers,
-            'connect_timeout': 10,
-            'request_timeout': 10,
-            'ca_certs': CA_CERTS,
-            'proxy_host': CONFIG.get('proxy_host'),
-            'proxy_port': CONFIG.get('proxy_port'),
-            'prepare_curl_callback': (
-                prepare_curl_socks5 if 'socks5' == CONFIG.get('proxy_type')
-                else None
-            )
+            "headers": req_headers,
+            "connect_timeout": 10,
+            "request_timeout": 10,
+            "ca_certs": CA_CERTS,
+            "proxy_host": CONFIG.get("proxy_host"),
+            "proxy_port": CONFIG.get("proxy_port"),
+            "prepare_curl_callback": (
+                prepare_curl_socks5 if "socks5" == CONFIG.get("proxy_type") else None
+            ),
         }
-        if 'referer' in api:
-            req_headers['Referer'] = api['referer']
+        if "referer" in api:
+            req_headers["Referer"] = api["referer"]
         if api.has_metadata:
             req_headers.update(await api.check_metadata(req_headers))
         url = api.get_url(x, y, z, retina)
@@ -835,11 +894,10 @@ async def get_tile(source, z, x, y, retina=False, client_headers=None):
                 response = await HTTP_CLIENT.fetch(url, **client_kwargs)
             elif ex.code >= 500:
                 raise
-        res = (response.body, response.headers['Content-Type'])
+        res = (response.body, response.headers["Content-Type"])
         del response
         if realtime:
-            TILE_SOURCE_CACHE.save(
-                cache_key, res, CONFIG.get('cache_realtime_ttl', 0))
+            TILE_SOURCE_CACHE.save(cache_key, res, CONFIG.get("cache_realtime_ttl", 0))
         else:
             TILE_SOURCE_CACHE[cache_key] = res
         return res
@@ -847,15 +905,15 @@ async def get_tile(source, z, x, y, retina=False, client_headers=None):
 
 def calc_grid(x, y, z, sgnxy, off_fn, grid_num=8):
     sgnx, sgny = sgnxy
-    sx0, sx1 = sorted((x, x+sgnx))
-    sy0, sy1 = sorted((y, y+sgny))
-    bbox = [float('inf'), float('inf'), float('-inf'), float('-inf')]
+    sx0, sx1 = sorted((x, x + sgnx))
+    sy0, sy1 = sorted((y, y + sgny))
+    bbox = [float("inf"), float("inf"), float("-inf"), float("-inf")]
     grid = []
     tz = z
-    for i in range(grid_num+1):
+    for i in range(grid_num + 1):
         gx = sx0 + i / grid_num
         column = []
-        for j in range(grid_num+1):
+        for j in range(grid_num + 1):
             gy = sy0 + j / grid_num
             tx, ty, tz = off_fn(gx, gy, z)
             column.append((gx - sx0, gy - sy0, tx, ty))
@@ -867,8 +925,10 @@ def calc_grid(x, y, z, sgnxy, off_fn, grid_num=8):
                 bbox[3] = max(bbox[3], ty)
         grid.append(column)
     bbox = [
-        math.floor(bbox[0]), math.floor(bbox[1]),
-        math.ceil(bbox[2]), math.ceil(bbox[3]),
+        math.floor(bbox[0]),
+        math.floor(bbox[1]),
+        math.ceil(bbox[2]),
+        math.ceil(bbox[3]),
     ]
     return bbox, grid, tz
 
@@ -881,24 +941,41 @@ def calc_pil_mesh(sgnxy, size, bbox, grid):
     pil_mesh = []
     for i, column in enumerate(grid[1:], 1):
         for j, coords in enumerate(column[1:], 1):
-            sx0, sy0, tx0, ty0 = grid[i-1][j-1]
+            sx0, sy0, tx0, ty0 = grid[i - 1][j - 1]
             sx1, sy1, tx1, ty1 = coords
-            pil_mesh.append((
-                (int(sx0 * szx), int(sy0 * szy),
-                 int(sx1 * szx), int(sy1 * szy)),
-                ((tx0 * sgnx + dx) * szx, (ty0 * sgny + dy) * szy,
-                 (tx0 * sgnx + dx) * szx, (ty1 * sgny + dy) * szy,
-                 (tx1 * sgnx + dx) * szx, (ty1 * sgny + dy) * szy,
-                 (tx1 * sgnx + dx) * szx, (ty0 * sgny + dy) * szy)
-            ))
+            pil_mesh.append(
+                (
+                    (int(sx0 * szx), int(sy0 * szy), int(sx1 * szx), int(sy1 * szy)),
+                    (
+                        (tx0 * sgnx + dx) * szx,
+                        (ty0 * sgny + dy) * szy,
+                        (tx0 * sgnx + dx) * szx,
+                        (ty1 * sgny + dy) * szy,
+                        (tx1 * sgnx + dx) * szx,
+                        (ty1 * sgny + dy) * szy,
+                        (tx1 * sgnx + dx) * szx,
+                        (ty0 * sgny + dy) * szy,
+                    ),
+                )
+            )
     return pil_mesh
 
 
 async def draw_tile(
     source, z, x, y, retina=False, client_headers=None, img_format=None
 ):
+    """
+    获取并处理瓦片图片
+    参数:
+    - source: 数据源名称
+    - z: 缩放级别
+    - x,y: 瓦片坐标
+    - retina: 是否请求高清瓦片
+    - client_headers: 客户端请求头
+    - img_format: 图片格式
+    """
     api = APIS[source]
-    retina = ('url2x' in api and retina)
+    retina = "url2x" in api and retina
     if api.fast_offset_check(z):
         res = await get_tile(source, z, x, y, retina, client_headers)
         return res
@@ -912,8 +989,7 @@ async def draw_tile(
         if (bbox[2] - bbox[0] == 1) and (bbox[3] - bbox[1] == 1):
             realx = bbox[0] if sgnxy[0] == 1 else bbox[2] - 1
             realy = bbox[1] if sgnxy[1] == 1 else bbox[3] - 1
-            res = await get_tile(source, realz, realx, realy,
-                                 retina, client_headers)
+            res = await get_tile(source, realz, realx, realy, retina, client_headers)
             return res
         futures = []
         if sgnxy[0] == 1:
@@ -926,21 +1002,30 @@ async def draw_tile(
             y_range = enumerate(range(bbox[3] - 1, bbox[1] - 1, -1))
         corners = tuple(itertools.product(x_range, y_range))
         for x1, y1 in corners:
-            futures.append(get_tile(
-                source, realz, x1[1], y1[1], retina, client_headers))
+            futures.append(
+                get_tile(source, realz, x1[1], y1[1], retina, client_headers)
+            )
         tiles = await tornado.gen.multi(futures)
         del futures
         ioloop = tornado.ioloop.IOLoop.current()
-        result = await ioloop.run_in_executor(None, stitch_tiles,
-            tiles, corners, bbox, grid, sgnxy, source,
-            img_format or api.get('format'))
+        result = await ioloop.run_in_executor(
+            None,
+            stitch_tiles,
+            tiles,
+            corners,
+            bbox,
+            grid,
+            sgnxy,
+            source,
+            img_format or api.get("format"),
+        )
         del tiles, corners, bbox, grid
         return result
 
 
 class PageHandler(tornado.web.RequestHandler):
     def base_url(self):
-        return '%s://%s' % (self.request.protocol, self.request.host)
+        return "%s://%s" % (self.request.protocol, self.request.host)
 
 
 class TileHandler(PageHandler):
@@ -952,31 +1037,29 @@ class TileHandler(PageHandler):
             raise tornado.web.HTTPError(404)
         try:
             client_headers = {
-                k:v for k,v in self.request.headers.items()
-                if k in HEADERS_WHITELIST
+                k: v for k, v in self.request.headers.items() if k in HEADERS_WHITELIST
             }
-            if not re_user_agent.match(client_headers.get('User-Agent', '')):
-                client_headers['User-Agent'] = DEFAULT_USER_AGENT
+            if not re_user_agent.match(client_headers.get("User-Agent", "")):
+                client_headers["User-Agent"] = DEFAULT_USER_AGENT
             res = await draw_tile(
-                name, int(z), int(x), int(y), bool(retina),
-                client_headers, img_format
+                name, int(z), int(x), int(y), bool(retina), client_headers, img_format
             )
-        #except tornado.httpclient.HTTPError as ex:
-            # raise tornado.web.HTTPError(502)
-        #except KeyError:
-            #raise tornado.web.HTTPError(404)
+        # except tornado.httpclient.HTTPError as ex:
+        # raise tornado.web.HTTPError(502)
+        # except KeyError:
+        # raise tornado.web.HTTPError(404)
         except ValueError:
             raise tornado.web.HTTPError(400)
         except Exception:
             raise
         if not res[0]:
             raise tornado.web.HTTPError(404)
-        if APIS[name].get('realtime'):
-            cache_ttl = CONFIG.get('cache_realtime_ttl', 0)
+        if APIS[name].get("realtime"):
+            cache_ttl = CONFIG.get("cache_realtime_ttl", 0)
         else:
-            cache_ttl = CONFIG['cache_ttl']
-        self.set_header('Content-Type', res[1])
-        self.set_header('Cache-Control', 'max-age=%d' % cache_ttl)
+            cache_ttl = CONFIG["cache_ttl"]
+        self.set_header("Content-Type", res[1])
+        self.set_header("Cache-Control", "max-age=%d" % cache_ttl)
         self.write(res[0])
 
 
@@ -993,21 +1076,29 @@ class MainHandler(PageHandler):
     def get(self):
         base_url = self.base_url()
         html = self.HTML_TEMPLATE.format(
-            endpoints=''.join((
-                '<dt>{title}</dt>'
-                '<dd>{baseurl}/{name}/{{z}}/{{x}}/{{y}}{hidpi}</dd>'
-            ).format(
-                title=APIS[s].get('name', s),
-                baseurl=base_url,
-                name=s,
-                hidpi=('{@2x}' if 'url2x' in APIS[s] else '')
-            ) for s in APIS),
-            baseurl=base_url
+            endpoints="".join(
+                (
+                    "<dt>{title}</dt>"
+                    "<dd>{baseurl}/{name}/{{z}}/{{x}}/{{y}}{hidpi}</dd>"
+                ).format(
+                    title=APIS[s].get("name", s),
+                    baseurl=base_url,
+                    name=s,
+                    hidpi=("{@2x}" if "url2x" in APIS[s] else ""),
+                )
+                for s in APIS
+            ),
+            baseurl=base_url,
         )
         self.write(html)
 
 
 class WMTSHandler(TileHandler):
+    """
+    WMTS标准服务处理器
+    提供标准的地图瓦片Web服务接口
+    """
+
     GET_CAPABILITIES_TEMPLATE = """<?xml version="1.0" encoding="UTF-8"?>
 <Capabilities xmlns="http://www.opengis.net/wmts/1.0" 
     xmlns:ows="http://www.opengis.net/ows/1.1" 
@@ -1286,81 +1377,91 @@ class WMTSHandler(TileHandler):
   </Layer>"""
 
     def get_capabilities(self):
-        self.set_header('Content-Type', 'application/xml; charset=UTF-8')
-        self.set_header('Cache-Control', 'max-age=86400')
+        self.set_header("Content-Type", "application/xml; charset=UTF-8")
+        self.set_header("Cache-Control", "max-age=86400")
         base_url = self.base_url()
         layers = []
         for name in APIS:
             api = APIS[name]
             params = {
-                'name': html.escape(name),
-                'title': html.escape(api.get('name', name)),
-                'baseurl': base_url,
+                "name": html.escape(name),
+                "title": html.escape(api.get("name", name)),
+                "baseurl": base_url,
             }
-            if api.get('attribution'):
-                params['abstract'] = html.escape('%s, %s' % (
-                    api.get('name', name), api['attribution']))
+            if api.get("attribution"):
+                params["abstract"] = html.escape(
+                    "%s, %s" % (api.get("name", name), api["attribution"])
+                )
             else:
-                params['abstract'] = html.escape(params['title'])
-            if api.get('format'):
-                params['mime'] = 'image/' + api['format'].lower()
+                params["abstract"] = html.escape(params["title"])
+            if api.get("format"):
+                params["mime"] = "image/" + api["format"].lower()
             else:
-                params['mime'] = 'image/png'
+                params["mime"] = "image/png"
             layers.append(self.LAYER_TEMPLATE.format(**params))
-        self.write(self.GET_CAPABILITIES_TEMPLATE.format(
-            baseurl=base_url, layers=''.join(layers)))
+        self.write(
+            self.GET_CAPABILITIES_TEMPLATE.format(
+                baseurl=base_url, layers="".join(layers)
+            )
+        )
 
     def get(self):
         arguments = {}
         for name, value in self.request.arguments.items():
             if not value:
                 continue
-            arguments[name.lower()] = value[0].decode('utf-8', errors='ignore')
+            arguments[name.lower()] = value[0].decode("utf-8", errors="ignore")
         if not arguments:
             return self.get_capabilities()
-        if arguments.get('service', '').lower() not in ('wms', 'wmts'):
+        if arguments.get("service", "").lower() not in ("wms", "wmts"):
             raise tornado.web.HTTPError(404)
-        request = arguments.get('request', '')
-        if request == 'GetCapabilities':
+        request = arguments.get("request", "")
+        if request == "GetCapabilities":
             return self.get_capabilities()
-        elif request == 'GetTile':
+        elif request == "GetTile":
             try:
-                z = int(arguments.get('tilematrix'))
-                x = int(arguments.get('tilecol'))
-                y = int(arguments.get('tilerow'))
+                z = int(arguments.get("tilematrix"))
+                x = int(arguments.get("tilecol"))
+                y = int(arguments.get("tilerow"))
             except (ValueError, TypeError):
                 raise tornado.web.HTTPError(400)
             # y = 2**z - 1 - y
-            layer = arguments.get('layer')
-            img_format = arguments.get('format')
+            layer = arguments.get("layer")
+            img_format = arguments.get("format")
             if img_format:
-                img_format = img_format.split('/', 1)[-1].upper()
+                img_format = img_format.split("/", 1)[-1].upper()
             else:
                 img_format = None
-            return self.get_tile_img(
-                layer, z, x, y, layer.endswith('@2x'), img_format)
+            return self.get_tile_img(layer, z, x, y, layer.endswith("@2x"), img_format)
         else:
             raise tornado.web.HTTPError(404)
 
 
 class TestHandler(tornado.web.RequestHandler):
     def get(self):
-        TEST_TILES = ('14/13518/6396', '4/14/8', '8/203/132', '9/430/240')
+        TEST_TILES = ("14/13518/6396", "4/14/8", "8/203/132", "9/430/240")
         html = (
-            '<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>'
-            '</head><body>%s</body></html>'
-        ) % ''.join('<p>%s</p><p>%s</p>' % (
-            ''.join('<img src="/%s/%s" title="%s">' % (s, tile, s) for s in APIS),
-            ''.join('<img src="/%s/%s@2x" title="%s">' % (s, tile, s) for s in APIS
-                if 'url2x' in APIS[s])
-        ) for tile in TEST_TILES)
+            "<!DOCTYPE html><html><head><title>TMS Tile Proxy Server</title>"
+            "</head><body>%s</body></html>"
+        ) % "".join(
+            "<p>%s</p><p>%s</p>"
+            % (
+                "".join('<img src="/%s/%s" title="%s">' % (s, tile, s) for s in APIS),
+                "".join(
+                    '<img src="/%s/%s@2x" title="%s">' % (s, tile, s)
+                    for s in APIS
+                    if "url2x" in APIS[s]
+                ),
+            )
+            for tile in TEST_TILES
+        )
         self.write(html)
 
 
 class RobotsTxtHandler(tornado.web.RequestHandler):
     def get(self):
-        txt = 'User-agent: *\nDisallow: /\n'
-        self.set_header('Content-Type', 'text/plain; charset=UTF-8')
+        txt = "User-agent: *\nDisallow: /\n"
+        self.set_header("Content-Type", "text/plain; charset=UTF-8")
         self.write(txt)
 
 
@@ -1369,18 +1470,20 @@ class DemoHandler(tornado.web.RequestHandler):
         layers_base = []
         layers_overlay = []
         for k, v in APIS.items():
-            obj = {'url': '/%s/{z}/{x}/{y}%s' % (k, '{r}' if 'url2x' in v else ''),
-                   'name': v.get('name', k),
-                   'attribution': v.get('attribution', '')}
-            if 'url2x' in v:
-                obj['url2x'] = v['url2x']
-            if 'annotation' in v:
+            obj = {
+                "url": "/%s/{z}/{x}/{y}%s" % (k, "{r}" if "url2x" in v else ""),
+                "name": v.get("name", k),
+                "attribution": v.get("attribution", ""),
+            }
+            if "url2x" in v:
+                obj["url2x"] = v["url2x"]
+            if "annotation" in v:
                 layers_overlay.append(obj)
             else:
                 layers_base.append(obj)
-        layers_attr = json.dumps([layers_base, layers_overlay], separators=(',', ':'))
-        with open(os.path.join(BASE_DIR, 'demo.html'), 'r', encoding='utf-8') as f:
-            html = f.read().replace('{{layers}}', layers_attr)
+        layers_attr = json.dumps([layers_base, layers_overlay], separators=(",", ":"))
+        with open(os.path.join(BASE_DIR, "demo.html"), "r", encoding="utf-8") as f:
+            html = f.read().replace("{{layers}}", layers_attr)
         self.write(html)
 
 
@@ -1389,44 +1492,56 @@ class TMSHandler(TileHandler):
         file_ext = file_ext.lower()
         if not file_ext:
             img_format = None
-        elif file_ext in ('.png'):
-            img_format = 'PNG'
-        elif file_ext in ('.jpg', '.jpeg'):
-            img_format = 'JPEG'
+        elif file_ext in (".png"):
+            img_format = "PNG"
+        elif file_ext in (".jpg", ".jpeg"):
+            img_format = "JPEG"
         else:
             img_format = file_ext[1:].upper()
         return self.get_tile_img(name, z, x, y, retina, img_format)
 
 
 def make_app():
-    return tornado.web.Application([
-        (r"/", MainHandler),
-        (r"/test", TestHandler),
-        (r"/map", DemoHandler),
-        (r"/wmts", WMTSHandler),
-        (r"/wmts/1.0.0/WMTSCapabilities.xml", WMTSHandler),
-        (r"/([^/]+)/(\d+)/(-?\d+)/(-?\d+)((?:@2x)?)((?:\.\w+)?)$", TMSHandler),
-        (r"/robots.txt", RobotsTxtHandler),
-    ])
+    return tornado.web.Application(
+        [
+            (r"/", MainHandler),
+            (r"/test", TestHandler),
+            (r"/map", DemoHandler),
+            (r"/wmts", WMTSHandler),
+            (r"/wmts/1.0.0/WMTSCapabilities.xml", WMTSHandler),
+            (r"/([^/]+)/(\d+)/(-?\d+)/(-?\d+)((?:@2x)?)((?:\.\w+)?)$", TMSHandler),
+            (r"/robots.txt", RobotsTxtHandler),
+        ]
+    )
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     import argparse
-    API_FILE = os.path.join(BASE_DIR, 'tmsapi.ini')
-    CONFIG_FILE = os.path.join(BASE_DIR, 'config.ini')
+
+    API_FILE = os.path.join(BASE_DIR, "tmsapi.ini")
+    CONFIG_FILE = os.path.join(BASE_DIR, "config.ini")
 
     parser = argparse.ArgumentParser(description="cnTMS tile proxy server")
-    parser.add_argument("-a", "--api-config", default=API_FILE, help=(
-        "API config file (default: tmsapi.ini)"))
-    parser.add_argument("-c", "--config", default=CONFIG_FILE, help=(
-        "Server config file (default: config.ini)"))
+    parser.add_argument(
+        "-a",
+        "--api-config",
+        default=API_FILE,
+        help=("API config file (default: tmsapi.ini)"),
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        default=CONFIG_FILE,
+        help=("Server config file (default: config.ini)"),
+    )
     args = parser.parse_args()
 
     load_config(args.config, args.api_config)
     app = make_app()
     http_server = tornado.httpserver.HTTPServer(app, xheaders=True)
-    http_server.listen(CONFIG['port'], CONFIG['listen'])
+    http_server.listen(CONFIG["port"], CONFIG["listen"])
     ioloop = tornado.ioloop.IOLoop.current()
     ioloop.set_default_executor(
-        concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count()))
+        concurrent.futures.ThreadPoolExecutor(max_workers=os.cpu_count())
+    )
     ioloop.start()
